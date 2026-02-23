@@ -1,5 +1,7 @@
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { logger } from '@/ui/logger';
 import { restoreStdinBestEffort } from '@/ui/ink/restoreStdinBestEffort';
@@ -84,6 +86,42 @@ export interface StartOptions {
      * Used for resuming inactive sessions.
      */
     existingSessionId?: string
+}
+
+/**
+ * Reads user-configured MCP servers from ~/.claude/settings.json,
+ * filtered by enabledMcpjsonServers from ~/.claude/settings.local.json.
+ * Returns an empty object on any error.
+ */
+async function readUserClaudeMcpServers(): Promise<Record<string, any>> {
+    try {
+        const claudeDir = join(os.homedir(), '.claude');
+        const settingsRaw = await readFile(join(claudeDir, 'settings.json'), 'utf8');
+        const settings = JSON.parse(settingsRaw) as Record<string, any>;
+        const allMcpServers: Record<string, any> = settings.mcpServers && typeof settings.mcpServers === 'object'
+            ? settings.mcpServers
+            : {};
+        if (Object.keys(allMcpServers).length === 0) return {};
+
+        let enabledList: string[] | null = null;
+        try {
+            const localRaw = await readFile(join(claudeDir, 'settings.local.json'), 'utf8');
+            const local = JSON.parse(localRaw) as Record<string, any>;
+            if (Array.isArray(local.enabledMcpjsonServers)) {
+                enabledList = local.enabledMcpjsonServers as string[];
+            }
+        } catch {
+            // settings.local.json missing or unreadable — allow all
+        }
+
+        if (!enabledList) return allMcpServers;
+
+        return Object.fromEntries(
+            Object.entries(allMcpServers).filter(([name]) => enabledList!.includes(name))
+        );
+    } catch {
+        return {};
+    }
 }
 
 export function extractMcpServersFromClaudeArgs(args?: string[]): { claudeArgs?: string[]; mcpServers: Record<string, any> } {
@@ -441,6 +479,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // preserve the user's raw `--mcp-config` flag for upstream Claude.
     const extractedMcp = extractMcpServersFromClaudeArgs(options.claudeArgs);
     options.claudeArgs = extractedMcp.claudeArgs;
+    const userClaudeMcpServers = await readUserClaudeMcpServers();
 
     // Start Happier MCP server
     const happyServer = await startHappyServer(session);
@@ -838,6 +877,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }
         },
 	        mcpServers: {
+	            ...userClaudeMcpServers,
 	            ...extractedMcp.mcpServers,
 	            // Keep Happy MCP server last so a user-provided "happy" entry cannot override it.
 	            happy: {
@@ -939,6 +979,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
 
     const extractedMcp = extractMcpServersFromClaudeArgs(options.claudeArgs);
     options.claudeArgs = extractedMcp.claudeArgs;
+    const userClaudeMcpServers = await readUserClaudeMcpServers();
 
     // Fast-start uses a deferred session client so we can spawn Claude before the server session exists.
     const messageQueue = new MessageQueue2<EnhancedMode>(hashClaudeEnhancedModeForQueue);
@@ -1368,6 +1409,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                         }
                     },
                     mcpServers: {
+                        ...userClaudeMcpServers,
                         ...extractedMcp.mcpServers,
                         happy: {
                             type: 'http' as const,
